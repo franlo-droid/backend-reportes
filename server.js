@@ -1,242 +1,138 @@
-import express from "express";
-import ExcelJS from "exceljs";
-import fs from "fs";
-import path from "path";
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const { google } = require("googleapis");
 
-// =====================
-// CONFIG
-// =====================
 const app = express();
-const PORT = process.env.PORT || 8080;
+app.use(cors());
+app.use(bodyParser.json({ limit: "50mb" }));
 
-// Si tu app manda JSON grande (base64 de foto), subí este límite.
-// Igual: lo correcto es subir fotos como archivo (después lo hacemos).
-app.use(express.json({ limit: "25mb" }));
+// Railway usa process.env.PORT
+const PORT = process.env.PORT || 3000;
 
-// CORS simple (para app/web)
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
+// === VARIABLES (Railway) ===
+const SHEET_ID = process.env.SHEET_ID;              // ID del Google Sheet
+const SHEET_TAB = process.env.SHEET_TAB || "Hoja 1";// Nombre de pestaña
+const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID;// Carpeta Drive para fotos
+const SA_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON; // JSON completo
 
-// =====================
-// PATHS (en Railway es mejor guardar en /app/data)
-// =====================
-const DATA_DIR = path.join(process.cwd(), "data");
-const EXCEL_FILE = path.join(DATA_DIR, "reportes.xlsx");
-const SHEET_NAME = "Reportes";
-
-function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!SHEET_ID || !DRIVE_FOLDER_ID || !SA_JSON) {
+  console.error("Faltan variables: SHEET_ID, DRIVE_FOLDER_ID, GOOGLE_SERVICE_ACCOUNT_JSON");
 }
 
-// =====================
-// COLA PARA EVITAR CORRUPCIÓN
-// =====================
-let writing = Promise.resolve();
-function enqueue(task) {
-  writing = writing.then(task).catch((e) => {
-    console.error("Error en cola:", e);
+function getAuth() {
+  // OJO: en Railway guardás el JSON como texto (una sola línea)
+  const creds = JSON.parse(SA_JSON);
+
+  return new google.auth.JWT({
+    email: creds.client_email,
+    key: creds.private_key,
+    scopes: [
+      "https://www.googleapis.com/auth/spreadsheets",
+      "https://www.googleapis.com/auth/drive",
+    ],
   });
-  return writing;
 }
 
-// =====================
-// HELPERS
-// =====================
+async function uploadImageToDrive(auth, { base64DataUrl, fileName }) {
+  const drive = google.drive({ version: "v3", auth });
 
-// ✅ Columnas “originales” (sin inventar nada nuevo)
-const COLUMNS = [
-  { header: "ID", key: "id", width: 20 },
-  { header: "Fecha", key: "fecha", width: 24 },
-  { header: "Turno", key: "turno", width: 10 },
-  { header: "Tipo", key: "tipo", width: 22 },
-  { header: "Equipo", key: "equipo", width: 22 },
-  { header: "Descripción", key: "descripcion", width: 50 },
-  { header: "Operador", key: "operador", width: 22 },
-  { header: "Área", key: "area", width: 18 },
-  { header: "SyncStatus", key: "syncStatus", width: 12 }
-];
+  // base64DataUrl: "data:image/png;base64,AAAA..."
+  const match = base64DataUrl.match(/^data:(image\/\w+);base64,(.+)$/);
+  if (!match) throw new Error("foto no es DataURL base64 válido");
 
-function ensureWorkbookStructure(workbook) {
-  let sheet = workbook.getWorksheet(SHEET_NAME);
-  if (!sheet) sheet = workbook.addWorksheet(SHEET_NAME);
+  const mimeType = match[1];
+  const base64 = match[2];
+  const buffer = Buffer.from(base64, "base64");
 
-  // Si no tiene columnas, las setea
-  if (!sheet.columns || sheet.columns.length === 0) {
-    sheet.columns = COLUMNS;
-    sheet.getRow(1).font = { bold: true };
-  }
-
-  return sheet;
-}
-
-async function loadOrCreateWorkbook() {
-  ensureDataDir();
-  const workbook = new ExcelJS.Workbook();
-
-  if (fs.existsSync(EXCEL_FILE)) {
-    await workbook.xlsx.readFile(EXCEL_FILE);
-  }
-
-  ensureWorkbookStructure(workbook);
-  return workbook;
-}
-
-function normalizeToArray(body) {
-  if (Array.isArray(body)) return body;
-  if (body && typeof body === "object") return [body];
-  return [];
-}
-
-function cleanReport(r) {
-  // Limpieza mínima, sin tocar tu lógica de negocio
-  return {
-    id: String(r.id ?? ""),
-    fecha: String(r.fecha ?? ""),
-    turno: String(r.turno ?? ""),
-    tipo: String(r.tipo ?? ""),
-    equipo: String(r.equipo ?? ""),
-    descripcion: String(r.descripcion ?? ""),
-    operador: String(r.operador ?? ""),
-    area: String(r.area ?? ""),
-    syncStatus: String(r.syncStatus ?? "synced")
-  };
-}
-
-function isValidReport(r) {
-  // Igual a tu validación: campos obligatorios
-  return r.id && r.fecha && r.turno && r.tipo && r.equipo && r.descripcion;
-}
-
-// =====================
-// ROUTES
-// =====================
-
-// Salud
-app.get("/health", (req, res) => {
-  ensureDataDir();
-  res.json({ ok: true, excelExists: fs.existsSync(EXCEL_FILE) });
-});
-
-// Estado real del Excel (para verificar actualización)
-app.get("/status", (req, res) => {
-  ensureDataDir();
-  const exists = fs.existsSync(EXCEL_FILE);
-  const stat = exists ? fs.statSync(EXCEL_FILE) : null;
-
-  res.json({
-    ok: true,
-    excelExists: exists,
-    excelPath: EXCEL_FILE,
-    lastModified: stat ? stat.mtime : null,
-    sizeBytes: stat ? stat.size : 0
+  const createRes = await drive.files.create({
+    requestBody: {
+      name: fileName,
+      parents: [DRIVE_FOLDER_ID],
+    },
+    media: {
+      mimeType,
+      body: require("stream").Readable.from(buffer),
+    },
+    fields: "id, webViewLink",
   });
-});
 
-// Crea el Excel a mano (prueba rápida)
-app.get("/test-create-excel", async (req, res) => {
-  try {
-    await enqueue(async () => {
-      const wb = await loadOrCreateWorkbook();
-      await wb.xlsx.writeFile(EXCEL_FILE);
-    });
-    res.send("✅ reportes.xlsx creado/asegurado");
-  } catch (e) {
-    console.error(e);
-    res.status(500).send("❌ Error creando Excel");
-  }
-});
+  const fileId = createRes.data.id;
 
-// ✅ Reset del excel (para volver a columnas limpias, usar UNA VEZ si querés)
-app.get("/reset-excel", async (req, res) => {
-  try {
-    await enqueue(async () => {
-      ensureDataDir();
-      if (fs.existsSync(EXCEL_FILE)) fs.unlinkSync(EXCEL_FILE);
-      const wb = await loadOrCreateWorkbook();
-      await wb.xlsx.writeFile(EXCEL_FILE);
-    });
-    res.send("✅ Excel reseteado con columnas originales");
-  } catch (e) {
-    console.error(e);
-    res.status(500).send("❌ Error reseteando Excel");
-  }
-});
+  // Hacerla visible "anyone with the link" (para que Sheets/App la vean)
+  await drive.permissions.create({
+    fileId,
+    requestBody: {
+      role: "reader",
+      type: "anyone",
+    },
+  });
 
-// Descargar el Excel (sin caché)
-app.get("/download/reportes.xlsx", (req, res) => {
-  ensureDataDir();
-  if (!fs.existsSync(EXCEL_FILE)) {
-    return res.status(404).send("No existe reportes.xlsx todavía");
-  }
+  // Link directo tipo "uc?export=view&id="
+  const directUrl = `https://drive.google.com/uc?export=view&id=${fileId}`;
+  return { fileId, directUrl };
+}
 
-  // Evita caché para que siempre baje lo último
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
+async function appendRowToSheet(auth, rowValues) {
+  const sheets = google.sheets({ version: "v4", auth });
 
-  res.download(EXCEL_FILE, "reportes.xlsx");
-});
+  // Append al final
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_TAB}!A:Z`,
+    valueInputOption: "USER_ENTERED",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: {
+      values: [rowValues],
+    },
+  });
+}
 
-// Endpoint principal: acepta ARRAY o UN SOLO OBJETO
+// Espera: [{id, fecha, turno, tipo, equipo, descripcion, operador, area, foto(base64DataURL)}]
 app.post("/api/reports", async (req, res) => {
-  const incoming = normalizeToArray(req.body);
-
-  console.log(`[POST] /api/reports recibido=${incoming.length}`);
-
-  if (incoming.length === 0) {
-    return res.status(400).json({ ok: false, error: "Body vacío o inválido" });
-  }
-
-  const cleaned = incoming
-    .filter((r) => r && typeof r === "object")
-    .map(cleanReport)
-    .map((r) => ({ ...r, syncStatus: "synced" })) // como antes: al guardarlo, queda synced
-    .filter(isValidReport);
-
-  if (cleaned.length === 0) {
-    return res.status(400).json({
-      ok: false,
-      error: "No hay reportes válidos para guardar (faltan campos obligatorios)."
-    });
-  }
-
   try {
-    await enqueue(async () => {
-      const wb = await loadOrCreateWorkbook();
-      const sheet = wb.getWorksheet(SHEET_NAME);
+    const reports = req.body;
+    if (!Array.isArray(reports)) {
+      return res.status(400).json({ error: "Array expected" });
+    }
 
-      // Append filas respetando columnas por key
-      for (const r of cleaned) {
-        sheet.addRow(r);
+    const auth = getAuth();
+    await auth.authorize();
+
+    for (const r of reports) {
+      let fotoUrl = "";
+      if (r.foto && typeof r.foto === "string" && r.foto.startsWith("data:image")) {
+        const up = await uploadImageToDrive(auth, {
+          base64DataUrl: r.foto,
+          fileName: `reporte_${r.id || Date.now()}.png`,
+        });
+        fotoUrl = up.directUrl;
       }
 
-      await wb.xlsx.writeFile(EXCEL_FILE);
+      // Ajustá este orden EXACTO a tus columnas de Google Sheet
+      // Ejemplo columnas: ID | FechaHora | Turno | TipoReporte | Equipo | Descripcion | Operario | Area | LinkFoto
+      const row = [
+        r.id || "",
+        r.fecha || "",
+        r.turno || "",
+        r.tipo || "",
+        r.equipo || "",
+        r.descripcion || "",
+        r.operador || "",
+        r.area || "",
+        fotoUrl,
+      ];
 
-      const stat = fs.statSync(EXCEL_FILE);
-      console.log(`[EXCEL] actualizado size=${stat.size} lastModified=${stat.mtime.toISOString()}`);
-    });
+      await appendRowToSheet(auth, row);
+    }
 
-    res.json({ ok: true, agregados: cleaned.length });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: "Error escribiendo reportes.xlsx" });
+    return res.json({ success: true, count: reports.length });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
-// =====================
-// START
-// =====================
-app.listen(PORT, () => {
-  console.log(`✅ Backend activo: http://localhost:${PORT}`);
-  console.log(`   Health: http://localhost:${PORT}/health`);
-  console.log(`   Status: http://localhost:${PORT}/status`);
-  console.log(`   Create Excel: http://localhost:${PORT}/test-create-excel`);
-  console.log(`   Reset Excel: http://localhost:${PORT}/reset-excel`);
-  console.log(`   Download Excel: http://localhost:${PORT}/download/reportes.xlsx`);
-});
+app.get("/", (req, res) => res.send("OK backend-reportes (Sheets+Drive)"));
 
+app.listen(PORT, () => console.log(`Server running on :${PORT}`));
